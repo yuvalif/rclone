@@ -457,10 +457,28 @@ func (f *Fs) InternalTestVersions(t *testing.T) {
 	// Purge gets tested later
 }
 
+func (f *Fs) InternalTestBucketLoggingRecordParsing(t *testing.T) {
+	line := "testid fish1 [21/Jan/2025:08:35:46 +0000] 127.0.0.1 testid 94a63bad-e365-45b3-a24d-5559438bb724.4185.1283611650307415202 " +
+		"REST.PUT.OBJECT myfile1 \"PUT /fish1/myfile1?uploadId=2~BRCOwy1vn1T1_uq8Ehm4wa4HoBpGPhV&partNumber=2 HTTP/1.1\" 200 - 6291456 6291456 - " +
+		"49ms - \"aws-cli/1.27.129 Python/3.9.21 Linux/5.14.0-508.el9.x86_64 botocore/1.29.138\" - - SigV4 TLS_AES_256_GCM_SHA384 AuthHeader 0 TLSv1.3 - -"
+	record, err := parseLogRecord(line)
+	assert.NoError(t, err)
+	expectedRecord := logRecord{
+		bucket:     "fish1",
+		objKey:     "myfile1",
+		operation:  "REST.PUT.OBJECT",
+		objSize:    "6291456",
+		objVersion: "-",
+		httpStatus: 200,
+	}
+	assert.Equal(t, expectedRecord, *record)
+}
+
 func (f *Fs) InternalTest(t *testing.T) {
 	t.Run("Metadata", f.InternalTestMetadata)
 	t.Run("NoHead", f.InternalTestNoHead)
 	t.Run("Versions", f.InternalTestVersions)
+	t.Run("BucketLoggingRecordParsing", f.InternalTestBucketLoggingRecordParsing)
 }
 
 var _ fstests.InternalTester = (*Fs)(nil)
