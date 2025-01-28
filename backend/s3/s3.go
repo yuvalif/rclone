@@ -4,6 +4,7 @@ package s3
 //go:generate go run gen_setfrom.go -o setfrom.go
 
 import (
+	"bufio"
 	"context"
 	"crypto/md5"
 	"crypto/tls"
@@ -2735,6 +2736,15 @@ use |-vv| to see the debug level logs.
 `, "|", "`"),
 			Default:  sdkLogMode(0),
 			Advanced: true,
+		}, {
+			Name: "use_bucket_logging",
+			Help: `Assume bucket logging is enabled on the bucket and that an initial sync was already performed.
+The bucket log would be used as a change journal. Instead of listing the bucket, the journal could be used to get a list of only the modifications to the bucket.
+Bucket logging will have to be enabled on the source bucket ahead of time. See: https://docs.aws.amazon.com/AmazonS3/latest/userguide/ServerLogs.html
+`,
+			Default:  false,
+			Advanced: true,
+			Provider: "AWS",
 		},
 		}})
 }
@@ -2889,6 +2899,7 @@ type Options struct {
 	UseUnsignedPayload    fs.Tristate          `config:"use_unsigned_payload"`
 	SDKLogMode            sdkLogMode           `config:"sdk_log_mode"`
 	DirectoryBucket       bool                 `config:"directory_bucket"`
+	UseBucketLogging      bool                 `config:"use_bucket_logging"`
 }
 
 // Fs represents a remote s3 server
@@ -4160,9 +4171,162 @@ type listOpt struct {
 	restoreStatus bool    // if set return restore status in listing too
 }
 
+type logRecord struct {
+	bucket        string
+	operation     string
+	objKey        string
+	objSize       string
+	objVersion   *string
+	httpStatus    int
+	owner         string
+	lastModified  time.Time
+}
+
+// parsing based on: https://docs.aws.amazon.com/AmazonS3/latest/userguide/LogFormat.html
+// example: testid fish1 [21/Jan/2025:08:35:46 +0000] 127.0.0.1 testid 94a63bad-e365-45b3-a24d-5559438bb724.4185.1283611650307415202 REST.PUT.OBJECT myfile1 "PUT /fish1/myfile1?uploadId=2~BRCOwy1vn1T1_uq8Ehm4wa4HoBpGPhV&partNumber=2 HTTP/1.1" 200 - 6291456 6291456 - 49ms - "aws-cli/1.27.129 Python/3.9.21 Linux/5.14.0-508.el9.x86_64 botocore/1.29.138" - - SigV4 TLS_AES_256_GCM_SHA384 AuthHeader 0 TLSv1.3 - -
+func parseLogRecord(line string) (*logRecord, error) {
+	var dummy, t1, t2, version string
+	record := new(logRecord)
+	n, err := fmt.Sscanf(line, "%s %s %s %s %s %s %s %s %s %q %d %s %s %s %s %s %s %q %s %s %s %s %s %s %s %s %s",
+		&record.owner,
+		&record.bucket,
+		&t1,    // time
+		&t2,    // tz
+		&dummy, // requester IP
+		&dummy, // account
+		&dummy, // request ID
+		&record.operation,
+		&record.objKey,
+		&dummy, // URI
+		&record.httpStatus,
+		&dummy, // http error
+		&dummy, // bytes
+		&record.objSize,
+		&dummy, // total time
+		&dummy, // turn around time
+		&dummy, // referer
+		&dummy, // user agent
+		&version,
+		&dummy, // host id
+		&dummy, // SigV2 or SigV4
+		&dummy, // SSL Cipher
+		&dummy, // auth type
+		&dummy, // fqdn
+		&dummy, // TLS version
+		&dummy, // access point ARN
+		&dummy) // ACL
+	if err != nil {
+		return nil, err
+	}
+	if n != 27 {
+		return nil, fmt.Errorf("bad number of fields in log format: %d", n)
+	}
+	layout := "[01/Jan/1970:00:00:00 +0000]"
+	record.lastModified, err = time.Parse(layout, t1+t2)
+	if err == nil {
+		return nil, err
+	}
+	if version != "-" {
+		record.objVersion = &version
+	}
+	return record, nil
+}
+
 // list lists the objects into the function supplied with the opt
 // supplied.
 func (f *Fs) list(ctx context.Context, opt listOpt, fn listFn) error {
+	if f.opt.UseBucketLogging {
+		fs.Debugf(f, "Trying to use bucket logging")
+		// get the bucket logging configuration
+		req := s3.GetBucketLoggingInput{
+			Bucket: &opt.bucket,
+		}
+		resp, err := f.c.GetBucketLogging(ctx, &req)
+		if err != nil {
+			fs.Debugf(f, "Failed to get bucket logging info: %s", err.Error())
+			return err
+		}
+		if resp.LoggingEnabled == nil {
+			fs.Debugf(f, "Bucket logging is disabled")
+			return nil
+		}
+
+		// read the information about the log bucket
+		logBucket := resp.LoggingEnabled.TargetBucket
+		logPrefix := resp.LoggingEnabled.TargetPrefix
+		// simple_key_format := resp.LoggingEnabled.TargetObjectKeyFormat.SimplePrefix != nil
+		// list the objects in the log bucket according to prefix
+		logListReq := s3.ListObjectsV2Input{
+			Bucket: logBucket,
+			Prefix: logPrefix,
+			// TODO: implement continuation loop
+		}
+		fs.Debugf(f, "Bucket logging is enabled with target bucket: %s and object prefix: %s",
+			*logBucket, *logPrefix)
+		// TODO: take time limit into prefix definition according to simple_key_format flag:
+		// [DestinationPrefix][YYYY]-[MM]-[DD]-[hh]-[mm]-[ss]-[UniqueString]
+		// [DestinationPrefix][SourceAccountId]/[SourceRegion]/[SourceBucket]/[YYYY]/[MM]/[DD]/[YYYY]-[MM]-[DD]-[hh]-[mm]-[ss]-[UniqueString]
+		logListResp, err := f.c.ListObjectsV2(ctx, &logListReq)
+		if err != nil {
+			fs.Debugf(f, "Failed to get list of logging objects: %s", err.Error())
+			return err
+		}
+		for _, obj := range logListResp.Contents {
+			// read keys from each object
+			logObjReq := s3.GetObjectInput {
+				Bucket: logBucket,
+				Key: obj.Key,
+			}
+			fs.Debugf(f, "Trying to read bucket logging object: %s", *obj.Key)
+			logObjResp, err := f.c.GetObject(ctx, &logObjReq)
+			if err != nil {
+				fs.Debugf(f, "Failed to read logging objects: %s", err.Error())
+				return err
+			}
+			// loop through the rows in the object that match the bucket
+			reader := logObjResp.Body
+			defer func() {
+				err := reader.Close()
+				if err != nil {
+					fs.Debugf(f, "Failed to close reader: %s", err.Error())
+				}
+			}()
+			scanner := bufio.NewScanner(reader)
+			for scanner.Scan() {
+				line := scanner.Text()
+				fs.Debugf(f, "Trying to parse record from logging object: %s", line)
+				record, err := parseLogRecord(line)
+				if err != nil {
+					fs.Debugf(f, "Failed to parse record from logging object: %s", err.Error())
+					return err
+				}
+				if record.bucket != opt.bucket || record.httpStatus != 200 || record.operation != "REST.PUT.OBJECT" {
+					fs.Debugf(f, "Skip logging record: %s", line)
+					continue
+				}
+				// TODO: refactor the full remote calculation function from the code below
+				remote := record.objKey
+				fs.Debugf(f, "Trying to apply action on logging record")
+				objSize, _ := strconv.ParseInt(record.objSize, 10, 64)
+				err = fn(remote, &types.Object{
+					Key: &record.objKey,
+					Owner: &types.Owner{ID: &record.owner},
+					Size: &objSize,
+					LastModified: &record.lastModified,
+					}, record.objVersion, false)
+				if err != nil {
+					if err == errEndList {
+						fs.Debugf(f, "No more actions needed")
+						return nil
+					}
+					fs.Debugf(f, "Failed to apply action on logging record: %s", err.Error())
+					return err
+				}
+			}
+		}
+		return nil
+	}
+
 	if opt.prefix != "" {
 		opt.prefix += "/"
 	}
@@ -4945,7 +5109,7 @@ func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, 
 var commandHelp = []fs.CommandHelp{{
 	Name:  "restore",
 	Short: "Restore objects from GLACIER or INTELLIGENT-TIERING archive tier",
-	Long: `This command can be used to restore one or more objects from GLACIER to normal storage 
+	Long: `This command can be used to restore one or more objects from GLACIER to normal storage
 or from INTELLIGENT-TIERING Archive Access / Deep Archive Access tier to the Frequent Access tier.
 
 Usage Examples:
